@@ -198,3 +198,196 @@ def choose_post_type(history: list[dict[str, Any]]) -> tuple[str, bool]:
         return "たまに宣伝", True
 
     choices = [name for name in NORMAL_TYPES if name not in recent_types[-2:]]
+    return random.choice(choices or NORMAL_TYPES), False
+
+
+def build_prompt(
+    post_type: str,
+    is_promo: bool,
+    promo_url: str | None,
+    topics: list[str],
+    recent_history: list[dict[str, Any]],
+    retry_errors: list[str] | None = None,
+) -> str:
+    recent_texts = [str(item.get("text", "")) for item in recent_history]
+    errors = "\n".join(f"- {error}" for error in (retry_errors or [])) or "- なし"
+    promo_line = (
+        f"今回は宣伝投稿。URLは必ず本文末尾に自然に1つだけ入れる: {promo_url}"
+        if is_promo
+        else "今回は通常投稿。URLは入れない。"
+    )
+
+    return textwrap.dedent(
+        f"""
+        MT5SPanelの開発者本人として、日本語のX投稿を1件だけ作成してください。
+
+        投稿タイプ: {post_type}
+        {promo_line}
+
+        必須条件:
+        - 文字数はURL込みで120文字前後、許容範囲は80〜150文字
+        - 人間の個人開発者が手で書いたような自然な文
+        - 宣伝臭を弱くし、MT5/FXの話題を主役にする
+        - 最近話題の候補を軽く混ぜる。無理にニュース風にしない
+        - 毎回同じ文体にしない
+        - 指示語を減らし、具体名や状況を書く
+        - ハッシュタグは0個か1個まで
+        - 「高速」「爆速」「革命」「次世代」「圧倒的」「最強」「完全自動」「誰でも簡単」は禁止
+        - 「できます」を連打しない。使うなら最大1回
+        - 同じ語尾の文を連続させない
+        - 過去30投稿と似た内容、同じ冒頭表現を避ける
+
+        最近話題の候補:
+        {json.dumps(topics, ensure_ascii=False)}
+
+        過去30投稿:
+        {json.dumps(recent_texts[-HISTORY_LIMIT:], ensure_ascii=False)}
+
+        前回の検査エラー:
+        {errors}
+
+        JSONのみで返してください:
+        {{"text":"投稿本文","topic_hint":"今回混ぜた話題を短く"}}
+        """
+    ).strip()
+
+
+def parse_json_output(output: str) -> dict[str, Any]:
+    output = output.strip()
+    if output.startswith("```"):
+        output = re.sub(r"^```(?:json)?\s*", "", output)
+        output = re.sub(r"\s*```$", "", output)
+    match = re.search(r"\{.*\}", output, flags=re.DOTALL)
+    if not match:
+        raise ValueError("JSON object not found in model output")
+    return json.loads(match.group(0))
+
+
+def create_response_with_retry(client: OpenAI, model: str, prompt: str) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            response = client.responses.create(
+                model=model,
+                input=prompt,
+                max_output_tokens=500,
+            )
+            return response.output_text
+        except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
+            last_error = exc
+            wait_seconds = min(30, 2 ** attempt)
+            print(
+                f"OpenAI API temporary error on attempt {attempt}/{API_RETRIES}: "
+                f"{exc.__class__.__name__}. Retrying in {wait_seconds}s.",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+    raise RuntimeError(f"OpenAI API request failed after retries: {last_error}") from last_error
+
+
+def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candidate:
+    post_type, is_promo = choose_post_type(history)
+    promo_url = random.choice(PROMO_URLS) if is_promo else None
+    topics = fetch_recent_topics()
+    recent_history = history[-HISTORY_LIMIT:]
+    retry_errors: list[str] = []
+    model = os.getenv("OPENAI_MODEL", "gpt-5.1")
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        prompt = build_prompt(post_type, is_promo, promo_url, topics, recent_history, retry_errors)
+        output_text = create_response_with_retry(client, model, prompt)
+        data = parse_json_output(output_text)
+        text = str(data.get("text", "")).strip()
+
+        if is_promo and promo_url and promo_url not in text:
+            text = f"{text.rstrip()} {promo_url}"
+
+        candidate = Candidate(
+            text=text,
+            post_type=post_type,
+            is_promo=is_promo,
+            topic_hint=str(data.get("topic_hint", "")).strip(),
+        )
+        errors = validate_candidate(candidate, recent_history)
+        if not errors:
+            return candidate
+        retry_errors = errors
+        time.sleep(1 + attempt)
+
+    raise RuntimeError(f"投稿文の検査を通過できませんでした: {retry_errors}")
+
+
+def post_to_x(text: str) -> str:
+    required = ["X_API_KEY", "X_API_SECRET", "X_ACCESS_TOKEN", "X_ACCESS_TOKEN_SECRET"]
+    missing = [name for name in required if not os.getenv(name)]
+    if missing:
+        raise RuntimeError(f"X API credentials are missing: {', '.join(missing)}")
+
+    auth = OAuth1(
+        os.environ["X_API_KEY"],
+        os.environ["X_API_SECRET"],
+        os.environ["X_ACCESS_TOKEN"],
+        os.environ["X_ACCESS_TOKEN_SECRET"],
+    )
+    response = requests.post(
+        "https://api.x.com/2/tweets",
+        auth=auth,
+        json={"text": text},
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"X API error {response.status_code}: {response.text}")
+    data = response.json()
+    return str(data.get("data", {}).get("id", ""))
+
+
+def append_history(
+    history: list[dict[str, Any]],
+    candidate: Candidate,
+    dry_run: bool,
+    tweet_id: str | None,
+) -> list[dict[str, Any]]:
+    history.append(
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "text": candidate.text,
+            "post_type": candidate.post_type,
+            "is_promo": candidate.is_promo,
+            "topic_hint": candidate.topic_hint,
+            "tweet_id": tweet_id,
+            "dry_run": dry_run,
+            "char_count": len(candidate.text),
+        }
+    )
+    return history
+
+
+def main() -> int:
+    load_dotenv(".env.local")
+    load_dotenv()
+
+    history_path = Path(os.getenv("POST_HISTORY_PATH", "data/post_history.json"))
+    dry_run = env_bool("DRY_RUN")
+
+    if not os.getenv("OPENAI_API_KEY"):
+        print("OPENAI_API_KEY is missing.", file=sys.stderr)
+        return 2
+
+    history = load_history(history_path)
+    client = OpenAI()
+    candidate = generate_candidate(client, history)
+
+    tweet_id = None
+    if dry_run:
+        print(candidate.text)
+    else:
+        tweet_id = post_to_x(candidate.text)
+        print(f"Posted to X: {tweet_id}")
+        history = append_history(history, candidate, dry_run, tweet_id)
+        save_history(history_path, history)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
