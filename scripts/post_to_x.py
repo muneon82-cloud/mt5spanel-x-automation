@@ -264,7 +264,10 @@ def parse_json_output(output: str) -> dict[str, Any]:
 
 
 def call_openai_chat_completion(model: str, prompt: str) -> str:
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = (os.getenv("OPENAI_API_KEY") or "").replace("\r", "").replace("\n", "")
+    api_key = api_key.strip().strip('"').strip("'")
+    if api_key.startswith("OPENAI_API_KEY="):
+        api_key = api_key.split("=", 1)[1].strip().strip('"').strip("'")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is missing.")
 
