@@ -37,6 +37,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Check OpenAI network
+        run: |
+          python - <<'PY'
+          import socket
+          import urllib.request
+
+          host = "api.openai.com"
+          print("DNS:", socket.gethostbyname(host))
+          try:
+              req = urllib.request.Request(f"https://{host}/v1/models")
+              urllib.request.urlopen(req, timeout=20)
+          except Exception as exc:
+              print("Connectivity check:", type(exc).__name__, str(exc)[:300])
+          PY
+
       - name: Generate and post
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
