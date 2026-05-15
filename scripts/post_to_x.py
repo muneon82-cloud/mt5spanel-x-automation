@@ -16,12 +16,13 @@ from xml.etree import ElementTree
 
 import requests
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 from requests_oauthlib import OAuth1
 
 
 HISTORY_LIMIT = 30
 MAX_RETRIES = 5
+API_RETRIES = 4
 PROMO_RATE = 0.2
 MIN_LENGTH = 80
 MAX_LENGTH = 150
@@ -262,6 +263,28 @@ def parse_json_output(output: str) -> dict[str, Any]:
     return json.loads(match.group(0))
 
 
+def create_response_with_retry(client: OpenAI, model: str, prompt: str) -> str:
+    last_error: Exception | None = None
+    for attempt in range(1, API_RETRIES + 1):
+        try:
+            response = client.responses.create(
+                model=model,
+                input=prompt,
+                max_output_tokens=500,
+            )
+            return response.output_text
+        except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
+            last_error = exc
+            wait_seconds = min(30, 2 ** attempt)
+            print(
+                f"OpenAI API temporary error on attempt {attempt}/{API_RETRIES}: "
+                f"{exc.__class__.__name__}. Retrying in {wait_seconds}s.",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+    raise RuntimeError(f"OpenAI API request failed after retries: {last_error}") from last_error
+
+
 def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candidate:
     post_type, is_promo = choose_post_type(history)
     promo_url = random.choice(PROMO_URLS) if is_promo else None
@@ -272,12 +295,8 @@ def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candida
 
     for attempt in range(1, MAX_RETRIES + 1):
         prompt = build_prompt(post_type, is_promo, promo_url, topics, recent_history, retry_errors)
-        response = client.responses.create(
-            model=model,
-            input=prompt,
-            max_output_tokens=500,
-        )
-        data = parse_json_output(response.output_text)
+        output_text = create_response_with_retry(client, model, prompt)
+        data = parse_json_output(output_text)
         text = str(data.get("text", "")).strip()
 
         if is_promo and promo_url and promo_url not in text:
