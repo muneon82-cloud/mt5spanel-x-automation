@@ -267,18 +267,31 @@ def create_response_with_retry(client: OpenAI, model: str, prompt: str) -> str:
     last_error: Exception | None = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            response = client.responses.create(
+            response = client.chat.completions.create(
                 model=model,
-                input=prompt,
-                max_output_tokens=500,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You write concise Japanese X posts and return JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=500,
+                temperature=0.9,
+                response_format={"type": "json_object"},
             )
-            return response.output_text
+            content = response.choices[0].message.content
+            if not content:
+                raise ValueError("OpenAI returned an empty message.")
+            return content
         except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
             last_error = exc
             wait_seconds = min(30, 2 ** attempt)
+            cause = repr(exc.__cause__) if exc.__cause__ else "no nested cause"
             print(
                 f"OpenAI API temporary error on attempt {attempt}/{API_RETRIES}: "
-                f"{exc.__class__.__name__}. Retrying in {wait_seconds}s.",
+                f"{exc.__class__.__name__}. Cause: {cause}. "
+                f"Retrying in {wait_seconds}s.",
                 file=sys.stderr,
             )
             time.sleep(wait_seconds)
@@ -291,7 +304,7 @@ def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candida
     topics = fetch_recent_topics()
     recent_history = history[-HISTORY_LIMIT:]
     retry_errors: list[str] = []
-    model = os.getenv("OPENAI_MODEL", "gpt-5.1")
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
     for attempt in range(1, MAX_RETRIES + 1):
         prompt = build_prompt(post_type, is_promo, promo_url, topics, recent_history, retry_errors)
