@@ -11,12 +11,12 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
 import requests
 from dotenv import load_dotenv
-from openai import APIConnectionError, APITimeoutError, OpenAI, RateLimitError
 from requests_oauthlib import OAuth1
 
 
@@ -263,42 +263,73 @@ def parse_json_output(output: str) -> dict[str, Any]:
     return json.loads(match.group(0))
 
 
-def create_response_with_retry(client: OpenAI, model: str, prompt: str) -> str:
+def call_openai_chat_completion(model: str, prompt: str) -> str:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is missing.")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You write concise Japanese X posts and return JSON only.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        "max_tokens": 500,
+        "temperature": 0.9,
+        "response_format": {"type": "json_object"},
+    }
+    request = Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "mt5spanel-x-automation/1.0",
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=45) as response:
+        data = json.loads(response.read().decode("utf-8"))
+
+    content = data["choices"][0]["message"]["content"]
+    if not content:
+        raise ValueError("OpenAI returned an empty message.")
+    return content
+
+
+def create_response_with_retry(model: str, prompt: str) -> str:
     last_error: Exception | None = None
     for attempt in range(1, API_RETRIES + 1):
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": "You write concise Japanese X posts and return JSON only.",
-                    },
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=500,
-                temperature=0.9,
-                response_format={"type": "json_object"},
-            )
-            content = response.choices[0].message.content
-            if not content:
-                raise ValueError("OpenAI returned an empty message.")
-            return content
-        except (APIConnectionError, APITimeoutError, RateLimitError) as exc:
+            return call_openai_chat_completion(model, prompt)
+        except HTTPError as exc:
             last_error = exc
+            body = exc.read().decode("utf-8", errors="replace")[:500]
+            if exc.code in {400, 401, 403, 404}:
+                raise RuntimeError(f"OpenAI API HTTP {exc.code}: {body}") from exc
             wait_seconds = min(30, 2 ** attempt)
-            cause = repr(exc.__cause__) if exc.__cause__ else "no nested cause"
             print(
                 f"OpenAI API temporary error on attempt {attempt}/{API_RETRIES}: "
-                f"{exc.__class__.__name__}. Cause: {cause}. "
-                f"Retrying in {wait_seconds}s.",
+                f"HTTP {exc.code}. Retrying in {wait_seconds}s.",
+                file=sys.stderr,
+            )
+            time.sleep(wait_seconds)
+        except (URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            wait_seconds = min(30, 2 ** attempt)
+            print(
+                f"OpenAI API temporary error on attempt {attempt}/{API_RETRIES}: "
+                f"{exc.__class__.__name__}: {exc}. Retrying in {wait_seconds}s.",
                 file=sys.stderr,
             )
             time.sleep(wait_seconds)
     raise RuntimeError(f"OpenAI API request failed after retries: {last_error}") from last_error
 
 
-def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candidate:
+def generate_candidate(history: list[dict[str, Any]]) -> Candidate:
     post_type, is_promo = choose_post_type(history)
     promo_url = random.choice(PROMO_URLS) if is_promo else None
     topics = fetch_recent_topics()
@@ -308,7 +339,7 @@ def generate_candidate(client: OpenAI, history: list[dict[str, Any]]) -> Candida
 
     for attempt in range(1, MAX_RETRIES + 1):
         prompt = build_prompt(post_type, is_promo, promo_url, topics, recent_history, retry_errors)
-        output_text = create_response_with_retry(client, model, prompt)
+        output_text = create_response_with_retry(model, prompt)
         data = parse_json_output(output_text)
         text = str(data.get("text", "")).strip()
 
@@ -387,8 +418,7 @@ def main() -> int:
         return 2
 
     history = load_history(history_path)
-    client = OpenAI()
-    candidate = generate_candidate(client, history)
+    candidate = generate_candidate(history)
 
     tweet_id = None
     if dry_run:
